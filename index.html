@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>AR 冰凍魔法</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: sans-serif; }
+        #canvas-container { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; z-index: 1; }
+        
+        /* UI 介面 */
+        #ui-layer {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%; 
+            z-index: 10; display: flex; justify-content: center; align-items: center;
+            pointer-events: none; /* 讓點擊穿透到按鈕 */
+        }
+        
+        #start-btn {
+            pointer-events: auto;
+            padding: 15px 30px;
+            font-size: 1.2rem;
+            background: linear-gradient(135deg, #a8c0ff, #3f2b96);
+            color: white;
+            border: 2px solid white;
+            border-radius: 30px;
+            cursor: pointer;
+            box-shadow: 0 0 20px rgba(100, 200, 255, 0.8);
+            transition: transform 0.2s;
+        }
+        
+        #start-btn:active { transform: scale(0.95); }
+        
+        .overlay-text {
+            position: absolute; bottom: 30px; width: 100%; text-align: center;
+            color: rgba(200, 255, 255, 0.8); font-size: 14px; text-shadow: 0 0 10px cyan;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="ui-layer">
+        <button id="start-btn">施展冰凍魔法 ✨</button>
+        <div class="overlay-text" id="status-text">準備中...</div>
+    </div>
+    <div id="canvas-container"></div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+    <script>
+        let camera, scene, renderer;
+        let video, videoTexture;
+        let uniforms;
+
+        const startBtn = document.getElementById('start-btn');
+        const statusText = document.getElementById('status-text');
+
+        startBtn.addEventListener('click', initAR);
+
+        async function initAR() {
+            startBtn.style.display = 'none';
+            statusText.innerText = "正在詠唱咒語 (開啟相機)...";
+
+            try {
+                // 1. 獲取相機權限
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { 
+                        facingMode: 'environment', // 優先使用後置鏡頭
+                        width: { ideal: 1280 },
+                        height: { ideal: 720 }
+                    }, 
+                    audio: false 
+                });
+
+                // 2. 設置影片元素
+                video = document.createElement('video');
+                video.srcObject = stream;
+                video.play();
+
+                video.onloadedmetadata = () => {
+                    statusText.innerText = "世界已凍結 ❄️";
+                    initThreeJS();
+                };
+
+            } catch (err) {
+                console.error(err);
+                statusText.innerText = "魔法失效：無法存取相機 (請確認權限或使用 HTTPS)";
+                startBtn.style.display = 'block';
+            }
+        }
+
+        function initThreeJS() {
+            const container = document.getElementById('canvas-container');
+
+            // 場景設置
+            scene = new THREE.Scene();
+            
+            // 正交相機 (2D 滿版效果)
+            camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            container.appendChild(renderer.domElement);
+
+            // 建立影片材質
+            videoTexture = new THREE.VideoTexture(video);
+            videoTexture.minFilter = THREE.LinearFilter;
+            videoTexture.magFilter = THREE.LinearFilter;
+
+            // --- 核心：冰凍效果 Shader ---
+            // 這裡是用 GLSL 語言寫的，負責把每個像素變成冰塊的感覺
+            const fragmentShader = `
+                uniform sampler2D tDiffuse;
+                uniform vec2 resolution;
+                uniform float time;
+                varying vec2 vUv;
+
+                // 隨機噪點函數
+                float random(vec2 p) {
+                    return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+                }
+
+                void main() {
+                    // 獲取原始相機像素
+                    vec4 color = texture2D(tDiffuse, vUv);
+
+                    // 1. 轉灰階 (去色)
+                    float gray = dot(color.rgb, vec3(0.299, 0.587, 0.114));
+
+                    // 2. 冰凍色調映射 (混合青色、白色和深藍色)
+                    vec3 iceColor = mix(vec3(0.0, 0.1, 0.3), vec3(0.6, 0.9, 1.0), gray);
+                    
+                    // 3. 增加一點 "閃爍" 的結晶感
+                    float noise = random(vUv * time) * 0.1;
+                    iceColor += vec3(noise);
+
+                    // 4. 邊緣結霜 (Vignette) - 讓角落變白變霧
+                    vec2 dist = vUv - 0.5;
+                    float len = length(dist);
+                    float frost = smoothstep(0.3, 0.8, len); // 調整這兩個數字改變結霜範圍
+                    
+                    // 混合結霜效果 (邊緣變白)
+                    vec3 finalColor = mix(iceColor, vec3(0.9, 0.95, 1.0), frost * 0.6);
+
+                    gl_FragColor = vec4(finalColor, 1.0);
+                }
+            `;
+
+            const vertexShader = `
+                varying vec2 vUv;
+                void main() {
+                    vUv = uv;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                }
+            `;
+
+            uniforms = {
+                tDiffuse: { value: videoTexture },
+                resolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
+                time: { value: 0 }
+            };
+
+            const material = new THREE.ShaderMaterial({
+                uniforms: uniforms,
+                vertexShader: vertexShader,
+                fragmentShader: fragmentShader
+            });
+
+            // 建立一個全螢幕的平面來播放處理過的畫面
+            const geometry = new THREE.PlaneGeometry(2, 2);
+            const mesh = new THREE.Mesh(geometry, material);
+            scene.add(mesh);
+
+            animate();
+            window.addEventListener('resize', onWindowResize, false);
+        }
+
+        function onWindowResize() {
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            if (uniforms) uniforms.resolution.value.set(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            if (uniforms) uniforms.time.value += 0.05; // 讓雜訊動起來
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
