@@ -2,263 +2,370 @@
 <html lang="zh-TW">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0">
-    <title>AR 流體冰結魔法</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>AR 冰霜投擲</title>
     <style>
-        body { margin: 0; overflow: hidden; background-color: #000; touch-action: none; }
+        body { margin: 0; overflow: hidden; background-color: #222; font-family: sans-serif; }
         #info {
-            position: absolute; top: 20px; width: 100%; text-align: center; color: #e0ffff; 
-            text-shadow: 0 0 8px #00ffff; pointer-events: none; z-index: 10;
-            background: rgba(0,0,0,0.5); padding: 15px 0;
+            position: absolute; top: 20px; width: 100%; text-align: center; color: #fff; 
+            text-shadow: 0 0 5px #00ffff; pointer-events: none; z-index: 10;
+            background: rgba(0,0,0,0.4); padding: 10px 0;
         }
-        /* 隱藏的影片元素 */
-        #video-feed { position: absolute; top: 0; left: 0; display: none; }
+        #guide {
+            position: absolute; bottom: 50px; width: 100%; text-align: center;
+            color: rgba(255,255,255,0.8); font-size: 1.2rem; pointer-events: none;
+            animation: pulse 2s infinite; opacity: 0; transition: opacity 0.5s;
+        }
+        @keyframes pulse { 0% { transform: translateY(0); opacity: 0.5; } 50% { transform: translateY(-10px); opacity: 1; } 100% { transform: translateY(0); opacity: 0.5; } }
     </style>
 </head>
 <body>
     <div id="info">
-        <span style="font-size:1.4em; font-weight:bold">🧊 流體冰結魔法</span><br>
-        <small>從螢幕下方往上滑動，施放冰霜流</small>
+        <b>AR 冰霜投擲</b><br>
+        找尋平面顯示準心後，<span style="color:#00ffff">手指上滑</span> 發射魔法
     </div>
+    <div id="guide">👆 向上滑動發射</div>
 
-    <video id="video-feed" autoplay playsinline webkit-playsinline muted></video>
-    
-    <canvas id="mask-canvas" style="display:none;"></canvas>
+    <script type="module">
+        import * as THREE from 'https://cdn.skypack.dev/three@0.136.0';
+        import { ARButton } from 'https://cdn.skypack.dev/three@0.136.0/examples/jsm/webxr/ARButton.js';
 
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-
-    <script>
         let camera, scene, renderer;
-        let video, videoTexture;
-        let maskCanvas, maskCtx, maskTexture;
-        let iceMaterial, noiseTexture;
-        let isDragging = false;
-        let lastTouch = null;
-        let audioCtx; // 音效 Context
+        let reticle;
+        let hitTestSource = null, hitTestSourceRequested = false;
+        
+        // 遊戲物件管理
+        const projectiles = []; // 飛行中的冰彈
+        const icePatches = [];  // 地面上的冰霜
+        let iceTexture;
+        
+        // 手勢變數
+        let touchStartY = 0;
+        let audioCtx;
 
         init();
+        animate();
 
-        async function init() {
-            // 1. 啟動相機
-            try {
-                const stream = await navigator.mediaDevices.getUserMedia({ 
-                    video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }, 
-                    audio: false 
-                });
-                video = document.getElementById('video-feed');
-                video.srcObject = stream;
-                video.onloadedmetadata = () => {
-                    video.play();
-                    initThreeJS();
-                };
-            } catch (err) {
-                alert("無法開啟相機，請確認權限或使用 HTTPS。");
-            }
-        }
-
-        function initThreeJS() {
-            // --- 基礎設置 ---
-            renderer = new THREE.WebGLRenderer({ antialias: true });
-            renderer.setSize(window.innerWidth, window.innerHeight);
-            renderer.setPixelRatio(window.devicePixelRatio);
-            document.body.appendChild(renderer.domElement);
+        function init() {
+            const container = document.createElement('div');
+            document.body.appendChild(container);
 
             scene = new THREE.Scene();
-            // 使用正交相機進行全螢幕 2D 渲染
-            camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
 
-            // --- 紋理準備 ---
-            videoTexture = new THREE.VideoTexture(video);
-            videoTexture.minFilter = THREE.LinearFilter;
+            // 燈光
+            const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+            light.position.set(0.5, 1, 0.25);
+            scene.add(light);
+            const pointLight = new THREE.DirectionalLight(0xaabbff, 0.8);
+            pointLight.position.set(0, 0, 0); // 光隨相機
+            camera.add(pointLight);
+            scene.add(camera);
 
-            // 創建程序化噪聲紋理 (用於冰霜細節和流動感)
-            noiseTexture = createNoiseTexture();
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            container.appendChild(renderer.domElement);
 
-            // 創建遮罩畫布 (用於紀錄手勢)
-            maskCanvas = document.getElementById('mask-canvas');
-            maskCanvas.width = window.innerWidth / 2; // 降低解析度提升效能
-            maskCanvas.height = window.innerHeight / 2;
-            maskCtx = maskCanvas.getContext('2d');
-            maskCtx.fillStyle = 'black';
-            maskCtx.fillRect(0, 0, maskCanvas.width, maskCanvas.height);
-            maskTexture = new THREE.CanvasTexture(maskCanvas);
+            document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['hit-test'] }));
 
-            // --- 核心：冰霜流體 Shader ---
-            iceMaterial = new THREE.ShaderMaterial({
-                uniforms: {
-                    tDiffuse: { value: videoTexture }, // 原始相機畫面
-                    tMask: { value: maskTexture },     // 手勢遮罩
-                    tNoise: { value: noiseTexture },   // 噪聲紋理
-                    uTime: { value: 0 },               // 時間 (用於流動動畫)
-                    uResolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) }
-                },
-                // Vertex Shader (標準)
-                vertexShader: `
-                    varying vec2 vUv;
-                    void main() {
-                        vUv = uv;
-                        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-                    }
-                `,
-                // Fragment Shader (核心效果)
-                fragmentShader: `
-                    uniform sampler2D tDiffuse;
-                    uniform sampler2D tMask;
-                    uniform sampler2D tNoise;
-                    uniform float uTime;
-                    uniform vec2 uResolution;
-                    varying vec2 vUv;
+            // 準心 (瞄準用)
+            reticle = new THREE.Mesh(
+                new THREE.RingGeometry(0.1, 0.12, 32).rotateX(-Math.PI / 2),
+                new THREE.MeshBasicMaterial({ color: 0x00ffff, opacity: 0.8, transparent: true })
+            );
+            reticle.matrixAutoUpdate = false;
+            reticle.visible = false;
+            scene.add(reticle);
 
-                    // 冰霜顏色調色盤
-                    vec3 iceColorDark = vec3(0.1, 0.3, 0.5);
-                    vec3 iceColorLight = vec3(0.6, 0.9, 1.0);
+            // 材質生成
+            iceTexture = generateIceTexture();
 
-                    void main() {
-                        vec4 original = texture2D(tDiffuse, vUv);
-                        vec4 mask = texture2D(tMask, vUv);
-                        
-                        // 1. 採樣噪聲，加入時間流動
-                        float noise = texture2D(tNoise, vUv * 1.5 + vec2(0.0, uTime * 0.05)).r;
-                        // 第二層噪聲增加細節
-                        float detailNoise = texture2D(tNoise, vUv * 3.0 - vec2(uTime * 0.02, 0.0)).r;
-                        
-                        // 2. 結合遮罩和噪聲，創造不規則的擴散邊緣
-                        // mask.r 是手指滑過的區域強度
-                        // 減去噪聲讓邊緣變得破碎、有結晶感
-                        float frostFactor = smoothstep(0.1, 0.6, mask.r * 1.5 + noise * 0.3 - detailNoise * 0.2);
-
-                        // 3. 冰霜材質計算
-                        // 根據原始畫面的亮度調整冰霜顏色 (看起來更像附著在物體上)
-                        float brightness = dot(original.rgb, vec3(0.299, 0.587, 0.114));
-                        vec3 finalIceColor = mix(iceColorDark, iceColorLight, brightness + noise * 0.2);
-                        
-                        // 增加結晶高光
-                        float specular = smoothstep(0.8, 1.0, noise * detailNoise + brightness * 0.3);
-                        finalIceColor += vec3(specular) * 0.5;
-
-                        // 4. 最終混合：原始畫面 vs 冰霜畫面
-                        // 使用 frostFactor 作為混合權重
-                        vec3 finalColor = mix(original.rgb, finalIceColor, frostFactor);
-
-                        // 增加冰霜邊緣的折射/發光感
-                        float edge = smoothstep(0.0, 0.1, frostFactor) * (1.0 - smoothstep(0.9, 1.0, frostFactor));
-                        finalColor += vec3(0.2, 0.5, 1.0) * edge * 0.3;
-
-                        gl_FragColor = vec4(finalColor, 1.0);
-                    }
-                `
+            // --- 手勢監聽 (Swipe) ---
+            window.addEventListener('touchstart', (e) => {
+                touchStartY = e.touches[0].clientY;
+                initAudio(); // 初始化音效
+            });
+            
+            window.addEventListener('touchend', (e) => {
+                const touchEndY = e.changedTouches[0].clientY;
+                const dist = touchStartY - touchEndY; // 計算滑動距離
+                
+                // 如果向上滑動距離超過 100px 且準心有瞄準到東西
+                if (dist > 100 && reticle.visible) {
+                    shootMagic();
+                }
             });
 
-            // 創建一個覆蓋全螢幕的平面
-            const geometry = new THREE.PlaneGeometry(2, 2);
-            const mesh = new THREE.Mesh(geometry, iceMaterial);
-            scene.add(mesh);
-
-            // --- 事件監聽 ---
             window.addEventListener('resize', onWindowResize);
-            // 手勢操作
-            window.addEventListener('touchstart', onTouchStart, { passive: false });
-            window.addEventListener('touchmove', onTouchMove, { passive: false });
-            window.addEventListener('touchend', onTouchEnd);
-            // 音效初始化
-            window.addEventListener('touchstart', initAudio, { once: true });
-
-            animate();
         }
 
-        // --- 程序化噪聲紋理 ---
-        function createNoiseTexture() {
-            const canvas = document.createElement('canvas');
-            canvas.width = 256; canvas.height = 256;
-            const ctx = canvas.getContext('2d');
-            const imgData = ctx.createImageData(256, 256);
-            for (let i = 0; i < imgData.data.length; i += 4) {
-                const val = Math.floor(Math.random() * 255);
-                imgData.data[i] = val;     // R
-                imgData.data[i+1] = val;   // G
-                imgData.data[i+2] = val;   // B
-                imgData.data[i+3] = 255;   // A
-            }
-            ctx.putImageData(imgData, 0, 0);
-            const tex = new THREE.CanvasTexture(canvas);
-            tex.wrapS = THREE.RepeatWrapping;
-            tex.wrapT = THREE.RepeatWrapping;
-            return tex;
-        }
+        // --- 發射魔法邏輯 ---
+        function shootMagic() {
+            playCastSound(); // 發射音效
 
-        // --- 手勢處理：在遮罩上繪畫 ---
-        function onTouchStart(e) {
-            e.preventDefault();
-            isDragging = true;
-            lastTouch = getCanvasCoordinates(e.touches[0]);
-            playIceSound(); // 播放音效
-        }
+            // 1. 建立冰彈
+            const geometry = new THREE.IcosahedronGeometry(0.05, 1);
+            const material = new THREE.MeshBasicMaterial({ color: 0xccffff });
+            const projectile = new THREE.Mesh(geometry, material);
 
-        function onTouchMove(e) {
-            e.preventDefault();
-            if (!isDragging) return;
-            const currentTouch = getCanvasCoordinates(e.touches[0]);
-            drawOnMask(lastTouch, currentTouch);
-            lastTouch = currentTouch;
-            if(Math.random() > 0.8) playIceSound(0.3 + Math.random()*0.3); // 隨機播放小聲的碎裂音
-        }
+            // 增加發光拖尾 (簡單的粒子或光暈)
+            const glowGeo = new THREE.IcosahedronGeometry(0.08, 1);
+            const glowMat = new THREE.MeshBasicMaterial({ color: 0x00ffff, transparent: true, opacity: 0.3 });
+            const glow = new THREE.Mesh(glowGeo, glowMat);
+            projectile.add(glow);
 
-        function onTouchEnd() {
-            isDragging = false;
-        }
+            // 2. 設定起點 (相機前方下方一點點，模擬從手發出)
+            // 將此位置轉為世界座標
+            const startPos = new THREE.Vector3(0, -0.2, -0.3).applyMatrix4(camera.matrixWorld);
+            projectile.position.copy(startPos);
 
-        function getCanvasCoordinates(touch) {
-            // 將觸控座標轉換為遮罩畫布座標
-            return {
-                x: (touch.clientX / window.innerWidth) * maskCanvas.width,
-                y: (touch.clientY / window.innerHeight) * maskCanvas.height
+            // 3. 設定目標 (準心位置)
+            const targetPos = new THREE.Vector3();
+            const targetQuat = new THREE.Quaternion();
+            reticle.matrix.decompose(targetPos, targetQuat, new THREE.Vector3());
+
+            // 4. 計算飛行速度向量
+            const velocity = new THREE.Vector3().subVectors(targetPos, startPos).normalize().multiplyScalar(0.15); // 速度 0.15
+
+            // 5. 儲存飛行資料
+            projectile.userData = {
+                velocity: velocity,
+                target: targetPos,
+                targetQuat: targetQuat, // 撞擊時要用的表面旋轉
+                life: 0
             };
+
+            scene.add(projectile);
+            projectiles.push(projectile);
         }
 
-        function drawOnMask(start, end) {
-            maskCtx.beginPath();
-            maskCtx.moveTo(start.x, start.y);
-            maskCtx.lineTo(end.x, end.y);
-            maskCtx.strokeStyle = 'white'; // 用白色繪製冰霜區域
-            // 筆刷大小隨機變化，模擬不規則噴射
-            maskCtx.lineWidth = 30 + Math.random() * 20; 
-            maskCtx.lineCap = 'round';
-            maskCtx.lineJoin = 'round';
-            // 使用柔和的筆觸
-            maskCtx.shadowBlur = 20;
-            maskCtx.shadowColor = 'white';
-            maskCtx.stroke();
-            // 標記紋理需要更新
-            maskTexture.needsUpdate = true;
+        // --- 撞擊：生成擴散冰霜 ---
+        function createImpact(position, quaternion) {
+            playFreezeSound(); // 撞擊音效
+
+            // 創建冰霜貼片
+            // 使用平面幾何體，但透過 Shader 或材質動畫來做擴散
+            const geometry = new THREE.PlaneGeometry(1, 1, 32, 32); 
+            
+            // 這裡我們用一個簡單的技巧：改變頂點位置來模擬不規則擴散
+            const posAttribute = geometry.attributes.position;
+            for(let i=0; i<posAttribute.count; i++) {
+                const x = posAttribute.getX(i);
+                const y = posAttribute.getY(i);
+                // 稍微擾動一下頂點讓形狀不那麼方正
+                const dist = Math.sqrt(x*x + y*y);
+                if(dist > 0.4) {
+                     posAttribute.setZ(i, (Math.random()-0.5)*0.05); // 邊緣起伏
+                }
+            }
+            geometry.computeVertexNormals();
+
+            const material = new THREE.MeshPhongMaterial({
+                map: iceTexture,
+                transparent: true,
+                opacity: 0.9,
+                color: 0xccf0ff,
+                emissive: 0x004488,
+                emissiveIntensity: 0.5,
+                side: THREE.DoubleSide,
+                alphaTest: 0.1,
+                polygonOffset: true,
+                polygonOffsetFactor: -1
+            });
+
+            const mesh = new THREE.Mesh(geometry, material);
+            mesh.position.copy(position);
+            mesh.quaternion.copy(quaternion);
+            mesh.rotateX(-Math.PI / 2); // 貼合平面
+            mesh.rotateZ(Math.random() * Math.PI * 2);
+            
+            // 初始狀態：很小
+            mesh.scale.set(0.01, 0.01, 0.01);
+            
+            // 擴散參數
+            mesh.userData = {
+                targetScale: 0.8 + Math.random() * 0.5, // 最終大小隨機
+                growthSpeed: 0.08, // 生長速度
+                wobble: Math.random() // 隨機波動參數
+            };
+
+            scene.add(mesh);
+            icePatches.push(mesh);
+
+            // 額外特效：撞擊粒子炸裂
+            createExplosion(position);
         }
 
-        // --- 程序化音效 ---
-        function initAudio() { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); audioCtx.resume(); }
-        function playIceSound(volume = 0.8) {
-            if (!audioCtx) return;
-            const t = audioCtx.currentTime;
-            const osc = audioCtx.createOscillator();
-            const gain = audioCtx.createGain();
-            const filter = audioCtx.createBiquadFilter();
-            filter.type = 'highpass'; filter.frequency.value = 3000 + Math.random()*2000; // 更高頻、更尖銳
-            osc.type = 'sawtooth'; osc.frequency.setValueAtTime(Math.random()*50, t);
-            gain.gain.setValueAtTime(0, t); gain.gain.linearRampToValueAtTime(volume, t+0.005);
-            gain.gain.exponentialRampToValueAtTime(0.01, t + 0.1 + Math.random()*0.2);
-            osc.connect(filter); filter.connect(gain); gain.connect(audioCtx.destination);
-            osc.start(); osc.stop(t + 0.4);
+        function createExplosion(pos) {
+            // 簡單的粒子爆炸
+            const count = 20;
+            const geo = new THREE.BufferGeometry();
+            const verts = [];
+            const vels = [];
+            for(let i=0; i<count; i++) {
+                verts.push(pos.x, pos.y, pos.z);
+                vels.push( (Math.random()-0.5)*0.05, Math.random()*0.05, (Math.random()-0.5)*0.05 );
+            }
+            geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+            geo.userData = { vels: vels };
+            
+            const mat = new THREE.PointsMaterial({ size: 0.05, color: 0xffffff, transparent: true });
+            const points = new THREE.Points(geo, mat);
+            scene.add(points);
+            
+            // 用簡單的方式管理這個短暫特效，不放入主循環
+            const startTime = Date.now();
+            function animateExplosion() {
+                const now = Date.now();
+                if(now - startTime > 500) { scene.remove(points); return; }
+                
+                const positions = points.geometry.attributes.position.array;
+                const velocities = points.geometry.userData.vels;
+                for(let i=0; i<count; i++) {
+                    positions[i*3] += velocities[i*3];
+                    positions[i*3+1] += velocities[i*3+1];
+                    positions[i*3+2] += velocities[i*3+2];
+                }
+                points.geometry.attributes.position.needsUpdate = true;
+                points.material.opacity -= 0.05;
+                requestAnimationFrame(animateExplosion);
+            }
+            animateExplosion();
+        }
+
+        // --- 紋理生成 ---
+        function generateIceTexture() {
+            const c = document.createElement('canvas'); c.width=256; c.height=256;
+            const ctx = c.getContext('2d');
+            ctx.clearRect(0,0,256,256);
+            
+            // 1. 放射狀冰晶
+            const cx = 128, cy = 128;
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
+            ctx.lineWidth = 2;
+            for(let i=0; i<40; i++) {
+                ctx.beginPath();
+                ctx.moveTo(cx, cy);
+                const angle = Math.random() * Math.PI * 2;
+                const len = 40 + Math.random() * 80;
+                // 畫出閃電般的折線
+                let currX = cx, currY = cy;
+                for(let j=0; j<5; j++) {
+                    currX += Math.cos(angle + (Math.random()-0.5)) * (len/5);
+                    currY += Math.sin(angle + (Math.random()-0.5)) * (len/5);
+                    ctx.lineTo(currX, currY);
+                }
+                ctx.stroke();
+            }
+
+            // 2. 邊緣柔光
+            const grad = ctx.createRadialGradient(cx, cy, 20, cx, cy, 120);
+            grad.addColorStop(0, 'rgba(200, 240, 255, 0.6)');
+            grad.addColorStop(0.8, 'rgba(200, 240, 255, 0.3)');
+            grad.addColorStop(1, 'rgba(255, 255, 255, 0)');
+            ctx.fillStyle = grad;
+            ctx.globalCompositeOperation = 'source-over'; // 混合
+            ctx.fillRect(0,0,256,256);
+
+            return new THREE.CanvasTexture(c);
+        }
+
+        // --- 音效 ---
+        function initAudio() { if(!audioCtx) { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); audioCtx.resume(); } }
+        
+        function playCastSound() { // 咻~
+            if(!audioCtx) return;
+            const osc = audioCtx.createOscillator(); const g = audioCtx.createGain();
+            osc.frequency.setValueAtTime(400, audioCtx.currentTime);
+            osc.frequency.exponentialRampToValueAtTime(1200, audioCtx.currentTime + 0.2);
+            g.gain.setValueAtTime(0.3, audioCtx.currentTime); g.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.3);
+            osc.connect(g); g.connect(audioCtx.destination); osc.start(); osc.stop(audioCtx.currentTime+0.3);
+        }
+
+        function playFreezeSound() { // 喀滋
+            if(!audioCtx) return;
+            const bufferSize = audioCtx.sampleRate * 0.5;
+            const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+            const data = buffer.getChannelData(0);
+            for(let i=0; i<bufferSize; i++) data[i] = Math.random()*2-1;
+            
+            const noise = audioCtx.createBufferSource(); noise.buffer = buffer;
+            const filter = audioCtx.createBiquadFilter(); filter.type = 'highpass'; filter.frequency.value = 2000;
+            const gain = audioCtx.createGain(); gain.gain.setValueAtTime(0.8, audioCtx.currentTime); 
+            gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime+0.4);
+            
+            noise.connect(filter); filter.connect(gain); gain.connect(audioCtx.destination);
+            noise.start();
         }
 
         function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
             renderer.setSize(window.innerWidth, window.innerHeight);
-            if (iceMaterial) iceMaterial.uniforms.uResolution.value.set(window.innerWidth, window.innerHeight);
         }
 
-        function animate() {
-            requestAnimationFrame(animate);
-            // 更新 Shader 時間參數，讓噪聲流動
-            if (iceMaterial) iceMaterial.uniforms.uTime.value += 0.02;
+        function render(timestamp, frame) {
+            // 1. AR Hit-Test (更新準心)
+            if (frame) {
+                const refSpace = renderer.xr.getReferenceSpace();
+                const session = renderer.xr.getSession();
+                if (!hitTestSourceRequested) {
+                    session.requestReferenceSpace('viewer').then(refSpace => {
+                        session.requestHitTestSource({ space: refSpace }).then(source => hitTestSource = source);
+                    });
+                    hitTestSourceRequested = true;
+                }
+                if (hitTestSource) {
+                    const hitTestResults = frame.getHitTestResults(hitTestSource);
+                    if (hitTestResults.length > 0) {
+                        const hit = hitTestResults[0];
+                        reticle.visible = true;
+                        reticle.matrix.fromArray(hit.getPose(refSpace).transform.matrix);
+                        // 顯示操作提示
+                        document.getElementById('guide').style.opacity = 1;
+                    } else {
+                        reticle.visible = false;
+                        document.getElementById('guide').style.opacity = 0;
+                    }
+                }
+            }
+
+            // 2. 更新飛行中的冰彈
+            for(let i=projectiles.length-1; i>=0; i--) {
+                const p = projectiles[i];
+                p.position.add(p.userData.velocity);
+                
+                // 檢查是否到達目標 (簡單距離檢測)
+                if(p.position.distanceTo(p.userData.target) < 0.2) {
+                    // 命中！
+                    createImpact(p.userData.target, p.userData.targetQuat);
+                    scene.remove(p);
+                    projectiles.splice(i, 1);
+                } else if (p.position.distanceTo(camera.position) > 20) {
+                    // 飛太遠消失
+                    scene.remove(p);
+                    projectiles.splice(i, 1);
+                }
+            }
+
+            // 3. 更新地上的冰霜 (擴散動畫)
+            icePatches.forEach(ice => {
+                if(ice.scale.x < ice.userData.targetScale) {
+                    // 像液體一樣快速擴張然後減速
+                    ice.userData.growthSpeed *= 0.95; 
+                    const s = Math.min(ice.userData.growthSpeed + 0.005, 0.1); // 最小速度
+                    ice.scale.addScalar(s);
+                    // 擴散時稍微旋轉一點，增加流動感
+                    ice.rotation.z += 0.01; 
+                }
+            });
+
             renderer.render(scene, camera);
         }
+
+        function animate() { renderer.setAnimationLoop(render); }
     </script>
 </body>
 </html>
