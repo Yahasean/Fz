@@ -3,300 +3,252 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>AR 冰霜魔法 - 最終版</title>
+    <title>真實表面冰霜蔓延</title>
     <style>
-        body { margin: 0; overflow: hidden; background-color: #000; font-family: sans-serif; touch-action: none; /* 防止觸控縮放 */ }
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: sans-serif; }
         
-        #ui-layer {
-            position: absolute; top: 0; left: 0; width: 100%; height: 100%; 
-            z-index: 10; display: flex; flex-direction: column;
-            justify-content: center; align-items: center;
-            background: rgba(0,0,0,0.6);
-            transition: opacity 0.5s;
-        }
-        
-        #start-btn {
-            padding: 15px 40px; font-size: 1.2rem; font-weight: bold;
-            background: linear-gradient(135deg, #00e5ff, #0072ff); color: white;
-            border: 2px solid rgba(255,255,255,0.5); border-radius: 30px; cursor: pointer;
-            box-shadow: 0 0 25px rgba(0, 229, 255, 0.7);
-            text-shadow: 0 0 5px rgba(0,0,0,0.5);
+        #info {
+            position: absolute; top: 20px; width: 100%; text-align: center; color: #fff; 
+            text-shadow: 0 0 5px #00f; pointer-events: none; z-index: 10;
+            background: rgba(0,0,0,0.3); padding: 10px 0;
         }
 
-        #status {
-            margin-top: 25px; color: #d0f0ff; text-align: center; max-width: 80%;
-            line-height: 1.6; font-size: 14px;
+        #ar-button-container button {
+            background-color: rgba(64, 224, 208, 0.8) !important;
+            border: 2px solid white !important;
+            border-radius: 20px !important;
+            font-weight: bold;
+            box-shadow: 0 0 15px cyan;
         }
-
-        /* 隱藏的影片元素 */
-        #video-feed { position: absolute; top: 0; left: 0; display: none; }
     </style>
 </head>
 <body>
-
-    <audio id="sound-freeze" src="freeze.mp3" preload="auto"></audio>
-
-    <div id="ui-layer">
-        <button id="start-btn">啟動冰霜魔法陣</button>
-        <div id="status">請允許相機與動作偵測權限<br>啟動後，點擊螢幕任意處施放魔法</div>
+    <div id="info">
+        <span style="font-size:1.2em">🧊 冰霜領主 AR</span><br>
+        Android: 使用 Chrome<br>
+        iOS: 請使用 <b>WebXR Viewer</b> App<br>
+        <small>掃描平面出現圓圈後，點擊讓冰霜蔓延</small>
     </div>
 
-    <video id="video-feed" autoplay playsinline webkit-playsinline muted></video>
+    <script type="module">
+        import * as THREE from 'https://cdn.skypack.dev/three@0.136.0';
+        import { ARButton } from 'https://cdn.skypack.dev/three@0.136.0/examples/jsm/webxr/ARButton.js';
 
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/DeviceOrientationControls.js"></script>
+        let container;
+        let camera, scene, renderer;
+        let controller;
+        let reticle;
+        let hitTestSource = null;
+        let hitTestSourceRequested = false;
+        
+        // 冰霜管理系統
+        const activeFreezes = []; // 正在蔓延的冰霜事件
+        let iceTexture; // 預先生成的材質
 
-    <script>
-        let camera, scene, renderer, controls;
-        let video, videoTexture;
-        let snowSystem;
-        let interactionSphere; // 隱形的互動球體
-        const raycaster = new THREE.Raycaster(); // 射線檢測器
-        const touchPoint = new THREE.Vector2(); // 儲存觸控位置
+        // 音效系統 context
+        let audioCtx;
 
-        const iceMeshes = [];
-        const startBtn = document.getElementById('start-btn');
-        const uiLayer = document.getElementById('ui-layer');
-        const statusText = document.getElementById('status');
-        const freezeSound = document.getElementById('sound-freeze');
+        init();
+        animate();
 
-        // --- 1. 啟動流程 (包含 iOS 權限請求) ---
-        startBtn.addEventListener('click', async () => {
-            statusText.innerText = "正在請求魔法權限...";
-            // 嘗試請求 iOS 動作感測權限
-            if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
-                try {
-                    const permissionState = await DeviceOrientationEvent.requestPermission();
-                    if (permissionState === 'granted') {
-                        startCamera();
-                    } else {
-                        statusText.innerText = "權限遭拒，無法感知方向。";
-                    }
-                } catch (error) {
-                    console.warn("權限請求失敗或非 iOS 設備，嘗試直接啟動:", error);
-                    startCamera(); 
-                }
-            } else {
-                // Android 或舊版設備
-                startCamera();
-            }
-        });
+        function init() {
+            container = document.createElement('div');
+            document.body.appendChild(container);
 
-        async function startCamera() {
-            statusText.innerText = "正在開啟靈視 (相機)...";
-            try {
-                const stream = await navigator.mediaDevices.getUserMedia({ 
-                    video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }, 
-                    audio: false 
-                });
-                video = document.getElementById('video-feed');
-                video.srcObject = stream;
-                video.play();
-                video.onloadedmetadata = () => {
-                    uiLayer.style.opacity = 0;
-                    setTimeout(() => uiLayer.style.display = 'none', 500);
-                    initThreeJS();
-                };
-            } catch (err) {
-                statusText.innerHTML = "相機啟動失敗。<br>請確認使用 HTTPS 且已允許權限。";
-                console.error(err);
-            }
-        }
-
-        function initThreeJS() {
             scene = new THREE.Scene();
-            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-            
-            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-            renderer.setSize(window.innerWidth, window.innerHeight);
-            renderer.setPixelRatio(window.devicePixelRatio);
-            document.body.appendChild(renderer.domElement);
 
-            // 將相機畫面設為背景
-            videoTexture = new THREE.VideoTexture(video);
-            videoTexture.minFilter = THREE.LinearFilter;
-            scene.background = videoTexture;
-
-            // 陀螺儀控制
-            controls = new THREE.DeviceOrientationControls(camera);
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
 
             // 燈光
-            const ambientLight = new THREE.AmbientLight(0xddf0ff, 0.6);
-            scene.add(ambientLight);
-            const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
-            dirLight.position.set(0, 10, 5);
-            scene.add(dirLight);
+            const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+            light.position.set(0.5, 1, 0.25);
+            scene.add(light);
+            const pointLight = new THREE.DirectionalLight(0xffffff, 0.5);
+            pointLight.position.set(0, 10, 0);
+            scene.add(pointLight);
 
-            // --- 關鍵：建立一個巨大的隱形球體用來接收點擊 ---
-            const sphereGeo = new THREE.SphereGeometry(5, 32, 32); // 半徑 5 公尺
-            // 將幾何體反轉，讓我們在球體內部
-            sphereGeo.scale(-1, 1, 1); 
-            const sphereMat = new THREE.MeshBasicMaterial({ visible: false }); // 隱形
-            interactionSphere = new THREE.Mesh(sphereGeo, sphereMat);
-            scene.add(interactionSphere);
+            // 渲染器
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true; 
+            container.appendChild(renderer.domElement);
 
-            createSnow();
+            // AR 按鈕 (Hit-test 是必須的)
+            const arBtn = ARButton.createButton(renderer, { requiredFeatures: ['hit-test'] });
+            document.body.appendChild(arBtn);
 
-            // --- 使用 touchstart 監聽手機觸控 ---
-            window.addEventListener('touchstart', onMobileTouch, { passive: false });
+            // 點擊事件
+            controller = renderer.xr.getController(0);
+            controller.addEventListener('select', onSelect);
+            scene.add(controller);
+
+            // 準心 (Reticle)
+            reticle = new THREE.Mesh(
+                new THREE.RingGeometry(0.15, 0.2, 32).rotateX(-Math.PI / 2),
+                new THREE.MeshBasicMaterial({ color: 0x00ffff })
+            );
+            reticle.matrixAutoUpdate = false;
+            reticle.visible = false;
+            scene.add(reticle);
+
+            // 預先生成材質與音效環境
+            iceTexture = generateFrostTexture();
+            window.addEventListener('click', initAudio); // 第一次點擊初始化音效
+            window.addEventListener('touchstart', initAudio);
+
             window.addEventListener('resize', onWindowResize);
-
-            animate();
         }
 
-        // --- 處理觸控事件 ---
-        function onMobileTouch(event) {
-            // 防止滑動畫面
-            event.preventDefault();
-
-            if (event.touches.length > 0) {
-                // 1. 播放音效
-                const sound = freezeSound.cloneNode();
-                sound.volume = 0.8;
-                sound.play().catch(e=>{});
-
-                // 2. 計算觸控點在螢幕上的標準化座標 (-1 到 +1)
-                touchPoint.x = (event.touches[0].clientX / window.innerWidth) * 2 - 1;
-                touchPoint.y = -(event.touches[0].clientY / window.innerHeight) * 2 + 1;
-
-                // 3. 執行射線檢測
-                castIceMagic();
+        // --- 音效合成系統 (Web Audio API) ---
+        // 產生類似冰裂的隨機噪聲，不需要 mp3 檔案
+        function initAudio() {
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            if (audioCtx.state === 'suspended') {
+                audioCtx.resume();
             }
         }
 
-        // --- 發射冰凍魔法 (射線檢測版) ---
-        function castIceMagic() {
-            // 從相機位置，往觸控點方向發射射線
-            raycaster.setFromCamera(touchPoint, camera);
+        function playIceSound() {
+            if (!audioCtx) return;
 
-            // 檢測射線是否打中隱形球體
-            const intersects = raycaster.intersectObject(interactionSphere);
-
-            if (intersects.length > 0) {
-                const hitData = intersects[0];
-                const hitPoint = hitData.point; // 打中的 3D 位置
-
-                // 生成冰塊材質 (更酷炫版)
-                const iceMat = new THREE.MeshPhongMaterial({
-                    map: createCoolIceTexture(), // 使用新的紋理生成函數
-                    transparent: true,
-                    opacity: 0.95,
-                    side: THREE.DoubleSide,
-                    shininess: 120,
-                    color: 0xeeffff,
-                    emissive: 0x003366, // 自發光效果
-                    emissiveIntensity: 0.3
-                });
-
-                // 建立冰塊模型 (隨機大小)
-                const size = 0.8 + Math.random() * 0.6;
-                const geometry = new THREE.CircleGeometry(size, 32);
-                const ice = new THREE.Mesh(geometry, iceMat);
-
-                // 將冰塊放置在打擊點
-                ice.position.copy(hitPoint);
-                // 讓冰塊面向相機
-                ice.lookAt(camera.position); 
-                // 隨機旋轉角度
-                ice.rotation.z = Math.random() * Math.PI * 2;
-
-                // 動畫設定
-                ice.scale.set(0,0,0);
-                ice.userData = { targetScale: 1.0, currentScale: 0.0, rotationSpeed: (Math.random()-0.5)*0.05 };
-
-                scene.add(ice);
-                iceMeshes.push(ice);
-            }
-        }
-
-        // --- 更酷炫的冰塊紋理生成 ---
-        function createCoolIceTexture() {
-            const canvas = document.createElement('canvas');
-            canvas.width = 256; canvas.height = 256;
-            const ctx = canvas.getContext('2d');
+            const t = audioCtx.currentTime;
             
-            // 清空
-            ctx.clearRect(0,0,256,256);
+            // 1. 高頻碎裂聲 (Highpass filtered noise)
+            const bufferSize = audioCtx.sampleRate * 0.5; // 0.5秒
+            const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+            const data = buffer.getChannelData(0);
+            for (let i = 0; i < bufferSize; i++) {
+                data[i] = Math.random() * 2 - 1;
+            }
 
-            // 1. 繪製銳利的冰裂紋 (畫兩次，一次粗一次細，增加層次感)
-            ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
-            ctx.lineWidth = 4;
-            drawCracks(ctx);
-            ctx.strokeStyle = 'rgba(255, 255, 255, 1.0)';
-            ctx.lineWidth = 1.5;
-            drawCracks(ctx);
-
-            // 2. 邊緣結霜光暈
-            const grad = ctx.createRadialGradient(128,128,40, 128,128,120);
-            grad.addColorStop(0, 'rgba(180, 230, 255, 0.1)');
-            grad.addColorStop(0.8, 'rgba(220, 245, 255, 0.6)');
-            grad.addColorStop(1, 'rgba(255, 255, 255, 0.0)');
-            ctx.fillStyle = grad;
-            ctx.fillRect(0,0,256,256);
+            const noise = audioCtx.createBufferSource();
+            noise.buffer = buffer;
             
-            // 3. 中心亮點
-            const centerGrad = ctx.createRadialGradient(128,128,0, 128,128,30);
-            centerGrad.addColorStop(0, 'rgba(255, 255, 255, 0.9)');
-            centerGrad.addColorStop(1, 'rgba(255, 255, 255, 0.0)');
-            ctx.fillStyle = centerGrad;
-            ctx.fillRect(0,0,256,256);
+            const filter = audioCtx.createBiquadFilter();
+            filter.type = 'highpass';
+            filter.frequency.value = 1000 + Math.random() * 2000; // 隨機高頻
 
-            return new THREE.CanvasTexture(canvas);
+            const gain = audioCtx.createGain();
+            // 聲音包絡線 (瞬間大聲然後快速消失)
+            gain.gain.setValueAtTime(0.5, t);
+            gain.gain.exponentialRampToValueAtTime(0.01, t + 0.1 + Math.random() * 0.2);
+
+            noise.connect(filter);
+            filter.connect(gain);
+            gain.connect(audioCtx.destination);
+            
+            noise.start();
+            noise.stop(t + 0.5);
         }
 
-        // 輔助函數：畫裂紋
-        function drawCracks(ctx) {
-            ctx.beginPath();
-            for(let i=0; i<12; i++) {
-                ctx.moveTo(128, 128);
-                // 隨機曲折的線條
-                let x = 128, y = 128;
-                for(let j=0; j<3; j++) {
-                    x += (Math.random()-0.5)*150;
-                    y += (Math.random()-0.5)*150;
-                    ctx.lineTo(x, y);
-                }
+        // --- 點擊觸發：開始蔓延 ---
+        function onSelect() {
+            if (reticle.visible) {
+                // 獲取準心的位置和旋轉 (代表表面)
+                const position = new THREE.Vector3();
+                const quaternion = new THREE.Quaternion();
+                const scale = new THREE.Vector3();
+                reticle.matrix.decompose(position, quaternion, scale);
+
+                // 創建一個新的蔓延事件
+                const freezeEvent = {
+                    center: position,
+                    quaternion: quaternion, // 這是關鍵：保持與表面平行
+                    age: 0,
+                    maxAge: 60, // 蔓延持續幀數
+                    radius: 0.1,
+                    spawnTimer: 0
+                };
+                activeFreezes.push(freezeEvent);
+                
+                playIceSound(); // 播放第一聲
             }
-            ctx.stroke();
         }
 
-
-        // --- 建立優化後的雪花 ---
-        function createSnow() {
-            const geom = new THREE.BufferGeometry();
-            const vertices = [];
-            // 擴大雪花範圍
-            for(let i=0; i<2000; i++) {
-                vertices.push((Math.random() - 0.5) * 25); // X
-                vertices.push((Math.random() - 0.5) * 25); // Y
-                vertices.push((Math.random() - 0.5) * 25); // Z
+        // --- 生成冰塊模型 ---
+        function spawnIcePatch(position, quaternion, scaleFactor) {
+            // 隨機生成不規則多邊形
+            const shape = new THREE.Shape();
+            const points = 5 + Math.floor(Math.random() * 4);
+            const r = 0.15 * scaleFactor;
+            for(let i=0; i<points; i++) {
+                const angle = (i / points) * Math.PI * 2;
+                const dist = r * (0.8 + Math.random() * 0.4);
+                const x = Math.cos(angle) * dist;
+                const y = Math.sin(angle) * dist;
+                if(i===0) shape.moveTo(x, y);
+                else shape.lineTo(x, y);
             }
-            geom.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
-            
-            // 使用程式碼生成的圓形紋理
-            const mat = new THREE.PointsMaterial({
-                size: 0.25,
-                map: createSnowTexture(),
+            shape.closePath();
+
+            const geometry = new THREE.ShapeGeometry(shape);
+            const material = new THREE.MeshPhongMaterial({
+                map: iceTexture,
                 transparent: true,
-                opacity: 0.85,
-                depthWrite: false,
-                blending: THREE.AdditiveBlending,
-                color: 0xffffff
+                opacity: 0, // 初始透明，之後淡入
+                color: 0xffffff,
+                emissive: 0x88ccff,
+                emissiveIntensity: 0.2,
+                side: THREE.DoubleSide,
+                depthWrite: false // 避免遮擋問題
             });
-            snowSystem = new THREE.Points(geom, mat);
-            scene.add(snowSystem);
+
+            const mesh = new THREE.Mesh(geometry, material);
+            
+            // 設定位置與旋轉
+            mesh.position.copy(position);
+            mesh.quaternion.copy(quaternion);
+            
+            // 必須旋轉 -90度 讓形狀貼合平面 (因 ShapeGeometry 預設是 XY 平面，而 Reticle 預設面向 Y 軸)
+            mesh.rotateX(-Math.PI / 2); 
+            mesh.rotateZ(Math.random() * Math.PI * 2);
+
+            // 稍微浮起來一點點，避免 Z-fighting (閃爍)
+            mesh.translateZ(0.005); 
+
+            mesh.userData = {
+                life: 0,
+                maxOpacity: 0.8 + Math.random() * 0.2
+            };
+
+            scene.add(mesh);
+            return mesh;
         }
 
-        function createSnowTexture() {
+        // --- 生成冰霜紋理 (Canvas) ---
+        function generateFrostTexture() {
             const canvas = document.createElement('canvas');
-            canvas.width = 64; canvas.height = 64;
+            canvas.width = 128; canvas.height = 128;
             const ctx = canvas.getContext('2d');
-            const grad = ctx.createRadialGradient(32,32,0, 32,32,32);
-            grad.addColorStop(0, 'rgba(255,255,255,1)');
-            grad.addColorStop(0.5, 'rgba(230,240,255,0.8)');
-            grad.addColorStop(1, 'rgba(255,255,255,0)');
+            
+            // 填充透明
+            ctx.clearRect(0,0,128,128);
+
+            // 畫隨機的冰針
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
+            ctx.lineWidth = 1;
+            for(let i=0; i<40; i++) {
+                const x = Math.random() * 128;
+                const y = Math.random() * 128;
+                const len = 5 + Math.random() * 20;
+                const angle = Math.random() * Math.PI * 2;
+                
+                ctx.beginPath();
+                ctx.moveTo(x, y);
+                ctx.lineTo(x + Math.cos(angle)*len, y + Math.sin(angle)*len);
+                ctx.stroke();
+            }
+
+            // 加上柔和的霧氣
+            const grad = ctx.createRadialGradient(64,64,20, 64,64,60);
+            grad.addColorStop(0, 'rgba(220, 240, 255, 0.6)');
+            grad.addColorStop(1, 'rgba(255, 255, 255, 0)');
             ctx.fillStyle = grad;
-            ctx.fillRect(0,0,64,64);
+            ctx.fillRect(0,0,128,128);
+
             return new THREE.CanvasTexture(canvas);
         }
 
@@ -306,32 +258,109 @@
             renderer.setSize(window.innerWidth, window.innerHeight);
         }
 
-        function animate() {
-            requestAnimationFrame(animate);
-            if(controls) controls.update();
+        // --- 主循環 ---
+        function render(timestamp, frame) {
+            
+            // 1. 處理冰霜蔓延邏輯
+            for (let i = activeFreezes.length - 1; i >= 0; i--) {
+                const event = activeFreezes[i];
+                event.age++;
+                event.spawnTimer++;
 
-            // 雪花飄落
-            if(snowSystem) {
-                const positions = snowSystem.geometry.attributes.position.array;
-                for(let i=1; i<positions.length; i+=3) {
-                    positions[i] -= 0.025; 
-                    if(positions[i] < -12) positions[i] = 12; 
+                // 每隔幾幀生成一個新的小冰塊
+                if (event.spawnTimer > 3 && event.age < event.maxAge) {
+                    event.spawnTimer = 0;
+                    
+                    // 隨機決定新冰塊在當前半徑內的位置
+                    // 這會產生「擴散」的效果
+                    const angle = Math.random() * Math.PI * 2;
+                    const dist = Math.random() * event.radius; // 在當前擴散半徑內
+                    
+                    // 計算局部座標偏移
+                    const offset = new THREE.Vector3(Math.cos(angle)*dist, 0, Math.sin(angle)*dist);
+                    // 將偏移量應用該表面的旋轉
+                    offset.applyQuaternion(event.quaternion);
+                    
+                    const spawnPos = event.center.clone().add(offset);
+                    
+                    // 生成冰塊
+                    const ice = spawnIcePatch(spawnPos, event.quaternion, 1.0 - (dist/2)); // 越外圍越小
+                    
+                    // 將冰塊加入場景動畫列表 (這裡簡化直接放 scene，但要處理淡入)
+                    activeIceAnimation(ice);
+
+                    // 慢慢擴大半徑
+                    event.radius += 0.02;
+
+                    // 偶爾播放聲音
+                    if (Math.random() > 0.7) playIceSound();
                 }
-                snowSystem.geometry.attributes.position.needsUpdate = true;
-                snowSystem.rotation.y += 0.0005; // 整體緩慢旋轉
+
+                if (event.age >= event.maxAge) {
+                    activeFreezes.splice(i, 1);
+                }
             }
 
-            // 冰塊動畫 (變大 + 旋轉)
-            iceMeshes.forEach(ice => {
-                if(ice.userData.currentScale < ice.userData.targetScale) {
-                    ice.userData.currentScale += 0.12; // 變大速度加快
-                    const s = ice.userData.currentScale;
-                    ice.scale.set(s, s, s);
-                    ice.rotation.z += ice.userData.rotationSpeed; // 增加一點動態旋轉
+            // 2. 更新所有冰塊的淡入效果
+            scene.traverse((object) => {
+                if (object.userData && object.userData.life !== undefined) {
+                    object.userData.life++;
+                    if (object.material.opacity < object.userData.maxOpacity) {
+                        object.material.opacity += 0.05;
+                    }
                 }
             });
 
+            // 3. AR Hit-Test (掃描表面)
+            if (frame) {
+                const referenceSpace = renderer.xr.getReferenceSpace();
+                const session = renderer.xr.getSession();
+
+                if (hitTestSourceRequested === false) {
+                    session.requestReferenceSpace('viewer').then(function (referenceSpace) {
+                        session.requestHitTestSource({ space: referenceSpace }).then(function (source) {
+                            hitTestSource = source;
+                        });
+                    });
+                    session.addEventListener('end', function () {
+                        hitTestSourceRequested = false;
+                        hitTestSource = null;
+                    });
+                    hitTestSourceRequested = true;
+                }
+
+                if (hitTestSource) {
+                    const hitTestResults = frame.getHitTestResults(hitTestSource);
+                    if (hitTestResults.length > 0) {
+                        const hit = hitTestResults[0];
+                        reticle.visible = true;
+                        reticle.matrix.fromArray(hit.getPose(referenceSpace).transform.matrix);
+                    } else {
+                        reticle.visible = false;
+                    }
+                }
+            }
+
             renderer.render(scene, camera);
+        }
+
+        // 簡單的冰塊動畫管理
+        function activeIceAnimation(mesh) {
+            // 這邊只做簡單的標記，實際更新在 render loop 的 traverse
+            mesh.scale.set(0.1, 0.1, 0.1);
+            
+            // 簡單的變大動畫
+            const grow = () => {
+                if(mesh.scale.x < 1) {
+                    mesh.scale.addScalar(0.1);
+                    requestAnimationFrame(grow);
+                }
+            };
+            grow();
+        }
+
+        function animate() {
+            renderer.setAnimationLoop(render);
         }
     </script>
 </body>
